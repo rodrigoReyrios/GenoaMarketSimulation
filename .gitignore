@@ -1,0 +1,6 @@
+#worksapce settings
+.vscode/
+.cspell/
+#cache and checkpoints
+.ipynb_checkpoints/
+GenoaMarket/__pycache__/
