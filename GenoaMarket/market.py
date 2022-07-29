@@ -6,7 +6,15 @@ from time import perf_counter
 import numpy as np
 import networkx as nx
 from .agent import Agent
-from .misc import make_time_string, make_demand_supply, DType
+from .misc import make_time_string, make_demand_supply, DType, price_to_log_returns
+from .sqlfunctions import (
+    create_engine_from_file,
+    insert_agents,
+    insert_market_state,
+    insert_orders,
+    insert_portfolios,
+    create_sqlite,
+)
 
 
 @dataclass
@@ -28,6 +36,8 @@ class Market:
         and all agents in a random cluster either sell or buy based on a 50/50 coin flip
     age :int = 0
         The age in 'turns' of the market
+    sql_interact :bool = False
+        Boolean determining weather or not to involve sql functionalities
     prices :list[float]
         The historical prices of the asset in the market
     agents :list[Agent]
@@ -41,6 +51,9 @@ class Market:
     pa: float = field(default=0.01)
     pc: float = field(default=0.2)
     age: int = field(default=0, init=False)
+    sql_interact: bool = field(default=False)
+    sql_login: str = field(default="")
+    db_name: str = field(default="market")
     prices: list[float] = field(init=False, repr=False)
     agents: list[Agent] = field(init=False, repr=False)
     network: nx.classes.graph.Graph = field(init=False, repr=False)
@@ -48,13 +61,35 @@ class Market:
     def __post_init__(self):
         # populate the agents array with self.N agents
         self.agents = [
-            Agent(C=0.0, A=0.0, Ti=20, prob=0.5, ind=i) for i in range(self.N)
+            Agent(C=0.0, A=0.0, Ti=20, prob=0.5, agent_id=i) for i in range(self.N)
         ]
         # start keeping track of the prices
         self.prices = [self.init_price]
         # initialize a network and add a node per agent
         self.network = nx.Graph()
         self.network.add_nodes_from(range(self.N))
+
+        # set up sql attributes if it's enabled
+        if self.sql_interact:
+            self.sql_init()
+
+    def sql_init(self):
+        """
+        Sets up sql attributes. Will create an engine and meta data based on input arguments
+        """
+        # check to see if a file name was passed, if not just use an sqlite engine link
+        # and call the database something generic like market
+        if self.sql_login == "":
+            self.engine, self.meta_data = create_sqlite(self.db_name)
+        else:
+            # if not load up the file location, it is expected that this has the appropriate tables
+            self.engine, self.meta_data = create_engine_from_file(
+                self.sql_login, self.db_name
+            )
+        # now that theres an engine we can setup the agents table
+        self.meta_data = insert_agents(
+            self.engine, self.agents, meta_data=self.meta_data
+        )
 
     def make_network(self):
         """
@@ -70,16 +105,16 @@ class Market:
         # draw the probabilities per edge
         edge_prob = np.random.uniform(size=int(self.N * (self.N + 1) / 2))
         # start a counter to keep track of which edge were looking at
-        im = 0
+        edge_index = 0
         # build edge list (i,j)
-        E = []
+        edges = []
         for i in range(self.N):
             for j in range(i + 1, self.N):
                 # check if this edge passes
-                if edge_prob[im] <= self.pa:
-                    E.append((i, j))
-                im += 1
-        self.network.add_edges_from(E)
+                if edge_prob[edge_index] <= self.pa:
+                    edges.append((i, j))
+                edge_index += 1
+        self.network.add_edges_from(edges)
 
     def reset_network(self):
         """
@@ -98,6 +133,8 @@ class Market:
     def distribute(self, C, A, dtype=DType.UNIFORM):
         """
         This method distributes an amount of cash and assets among the markets agents.
+        If self.sql_interact is True then this is also the step where the portfolio's
+        table get there first row from.
 
         Args:
             C :float - The amount of cash to distribute
@@ -113,9 +150,9 @@ class Market:
             # compute the number of cash and assets per agent
             cash_per = C / self.N
             asset_per = floor(A / self.N)
-            for A in self.agents:
-                A.C += cash_per
-                A.A += asset_per
+            for agent in self.agents:
+                agent.C += cash_per
+                agent.A += asset_per
 
         # distribute C cash and A assets mostly to a few people and then
         # the reminder is divvy up among everyone else
@@ -158,15 +195,15 @@ class Market:
         # make the social network
         self.make_network()
         # get connected components (this includes singletons)
-        S = [
+        clusters = [
             self.network.subgraph(c).copy()
             for c in nx.connected_components(self.network)
             if len(c) > 1
         ]
         # see if we activate a cluster
-        if (np.random.uniform() < self.pc) and (len(S) != 0):
+        if (np.random.uniform() < self.pc) and (len(clusters) != 0):
             # now that a cluster is going to be activated we choose which cluster gets activated
-            cluster = S[np.random.choice(range(len(S)))]
+            cluster = clusters[np.random.choice(range(len(clusters)))]
             # choose to activate this cluster as a sell or buy cluster via a coin flip
             new_p = float(np.random.uniform() <= 0.5)
             for n_id in cluster.nodes:
@@ -204,63 +241,65 @@ class Market:
         Raises:
             N/A
         """
-        # draw a random value [0,1] per agent
-        R = np.random.uniform(size=self.N)
-        # draw a random value [0,1] to decide if agents will buy or sell
-        buy_or_sell = np.random.uniform(size=self.N)
+        # draw 2 self.N sized arrays, one for the proportion of cash/asset an agent uses
+        # one to determine if the agent buy or sells
+        proportions, buy_or_sell_pre = np.random.uniform(size=(2, self.N))
 
-        # calculate the log price returns array
-        # agents have built in methodology if its to short or long
-        prices = np.array(self.prices)
-        log_price_returns = np.log(prices[1:] / prices[:-1])
+        # actually see if the agent will buy or sell as a boolean
+        buy_or_sell = buy_or_sell_pre < [agent.prob for agent in self.agents]
 
-        # instantiate two list, each keeping track of buy and sell orders
-        buy_orders = []
-        sell_orders = []
+        # get the log price returns
+        log_price_returns = price_to_log_returns(self.prices)
 
-        # loop over agents
+        # initialize the arrays of buy/sell orders
+        # shape is (h)x3 and (N-h)x3 where h is the number of buy entries
+        h = np.sum(buy_or_sell)
+        buy_orders, sell_orders = np.empty([h, 3]), np.empty([self.N - h, 3])
+
+        buy_count, sell_count = 0, 0
+
+        # enumerate over the agents
         for i, agent in enumerate(self.agents):
-
-            # decide if the agent will make a buy or sell order
-            if buy_or_sell[i] < agent.prob:
-                # make a buy order
-                a_b, bi = agent.make_buy_order(
-                    R[i], self.prices[-1], log_price_returns[-agent.Ti :]
-                )
-                buy_orders.append([a_b, bi, i])
+            # see if this particular agent sold
+            agent_bought = buy_or_sell[i]
+            # make the order
+            amount, limit = agent.make_order(
+                proportions[i],
+                self.prices[-1],
+                log_price_returns[-agent.Ti :],
+                agent_bought,
+            )
+            # assign the appropriate entry in either the buy orders or sell orders matrix
+            if agent_bought:
+                buy_orders[buy_count] = amount, limit, i
+                buy_count += 1
             else:
-                # make a sell order
-                a_s, si = agent.make_sell_order(
-                    R[i], self.prices[-1], log_price_returns[-agent.Ti :]
-                )
-                sell_orders.append([a_s, si, i])
+                sell_orders[sell_count] = amount, limit, i
+                sell_count += 1
 
-        # return these two as Buy and Sell order arrays sorted by limit prices
-        buy_orders = np.array(buy_orders)
-        sell_orders = np.array(sell_orders)
-
+        # sort the orders
         sorted_buy_orders = buy_orders[buy_orders[:, 1].argsort()]
         sorted_sell_orders = sell_orders[sell_orders[:, 1].argsort()]
 
         return sorted_buy_orders, sorted_sell_orders
 
-    def market_price(self, BO, SO):
+    def market_price(self, buy_orders, sell_orders):
         """
         This method determines the Market price of the asset based on buy and sell orders.
         Appends the new market price calculation to the self.prices attribute.
 
         Args:
-            BO :numpy.array - an (N-h)x2 array representing [buy amount,limit price,agent index]
-                pairs
-            SO :numpy.array - an (h)x2 array representing [sell amount,limit price,agent index]
-                pairs
+            buy_orders :numpy.array - an (N-h)x2 array representing
+                [buy amount,limit price,agent index]
+            sell_orders :numpy.array - an (h)x2 array representing
+                [sell amount,limit price,agent index]
         Returns:
             N/A
         Raises:
             N/A
         """
         # calculate the demand and supply curve from buy and sell orders
-        demand, supply = make_demand_supply(BO, SO)
+        demand, supply = make_demand_supply(buy_orders, sell_orders)
 
         # get the combined domains of the supply and demand curves
         X = np.unique(np.hstack([demand.x, supply.x]))
@@ -287,23 +326,25 @@ class Market:
         else:
             raise ValueError(f"i dont know shape at Age={self.age}")
 
-    def execute_orders(self, BO, SO):
+    def execute_orders(self, buy_orders, sell_orders):
         """
         Executes the orders based on the latest market price (self.prices[-1]).
 
         Args:
-            BO :numpy.array - an (N-h)x2 array representing [buy amount,limit price,agent index] pairs
-            SO :numpy.array - an (h)x2 array representing [sell amount,limit price,agent index] pairs
+            buy_orders :numpy.array - an (N-h)x3 array representing
+                [buy amount,limit price,agent index]
+            sell_orders :numpy.array - an (h)x3 array representing
+                [sell amount,limit price,agent index]
         Returns:
             None
         Raises:
             ValueError("No Trades Possible")
         """
         # get the market price this time step
-        pstar = self.prices[-1]
+        p_star = self.prices[-1]
         # get Buy and Sell orders that fall within market price
-        valid_buys = BO[BO[:, 1] >= pstar]
-        valid_sells = SO[SO[:, 1] <= pstar]
+        valid_buys = buy_orders[buy_orders[:, 1] >= p_star]
+        valid_sells = sell_orders[sell_orders[:, 1] <= p_star]
 
         # we may need to get rid of some orders
         # if the sum of the stock in valid buys dont align with the sum of stocks
@@ -326,8 +367,8 @@ class Market:
         for _ in range(delta):
             rows, __ = select_rows.shape
             # choose a row weighted by the number of stocks ordered
-            ps = select_rows[:, 0] / np.sum(select_rows[:, 0])
-            row_index = np.random.choice(range(rows), p=ps)
+            probs = select_rows[:, 0] / np.sum(select_rows[:, 0])
+            row_index = np.random.choice(range(rows), p=probs)
             # now that this row is selected remove a stock from it
             select_rows[row_index, 0] -= 1
 
@@ -336,15 +377,15 @@ class Market:
         for row in valid_buys:
             asset_amount, __, i = row
             i = int(i)
-            price = asset_amount * pstar
-            # the ith agent buys asset_amount for a totall of price
+            price = asset_amount * p_star
+            # the ith agent buys asset_amount for a total of price
             self.agents[i].A += asset_amount
             self.agents[i].C -= price
         for row in valid_sells:
             asset_amount, __, i = row
             i = int(i)
-            price = asset_amount * pstar
-            # the ith agent sells asset_amount for a totall of price
+            price = asset_amount * p_star
+            # the ith agent sells asset_amount for a total of price
             self.agents[i].A -= asset_amount
             self.agents[i].C += price
 
@@ -353,6 +394,7 @@ class Market:
         Simulating the market over tau steps. Simulation loop is:
             1) Make and activate social clusters
             2) computes buy and sell orders
+            2a) sends rows to market state, orders, and portfolios table for this age
             3) computes the new market price
             4) execute orders
             5) deactivates and removes clusters
@@ -374,6 +416,32 @@ class Market:
             self.cluster()
             # calculate buy and sell orders
             buy_orders, sell_orders = self.make_orders()
+
+            # if sql_interact is on, log the market state, the orders that respond to this market
+            # , and the agents portfolio before things get executed
+            if self.sql_interact:
+                self.meta_data = insert_market_state(
+                    self.engine,
+                    self.age,
+                    market_price=self.prices[-1],
+                    buy_orders=np.sum(buy_orders[:, 0]),
+                    sell_orders=np.sum(sell_orders[:, 0]),
+                    meta_data=self.meta_data,
+                )
+                self.meta_data = insert_orders(
+                    self.engine,
+                    buy_orders,
+                    sell_orders,
+                    self.age,
+                    meta_data=self.meta_data,
+                )
+                self.meta_data = insert_portfolios(
+                    self.engine,
+                    self.agents,
+                    self.age,
+                    meta_data=self.meta_data,
+                )
+
             # check to see if one of the orders has weird shape
             if buy_orders.shape == (0,):
                 raise IndexError("No Buy Orders Issued, Terminating Sim")
@@ -381,7 +449,7 @@ class Market:
                 raise IndexError("No Sell Orders Issued, Terminating Sim")
             # calculate the market price of asset due to the orders
             self.market_price(buy_orders, sell_orders)
-            # execute orders
+            # execute orders / this also send orders to sql server if enabled
             try:
                 self.execute_orders(buy_orders, sell_orders)
             except ValueError as error:
@@ -390,6 +458,27 @@ class Market:
             self.un_cluster()
             # age the market
             self.age += 1
+        # at this point weve both set the market price and executed orders,
+        # if sql is enables update these tables but not the orders tables
+        # also make sure the buy and sell columns on the mark state row is Null
+        if self.sql_interact:
+            # update market state
+            self.meta_data = insert_market_state(
+                self.engine,
+                self.age,
+                market_price=self.prices[-1],
+                buy_orders=None,
+                sell_orders=None,
+                meta_data=self.meta_data,
+            )
+            # update the portfolios
+            self.meta_data = insert_portfolios(
+                self.engine,
+                self.agents,
+                self.age,
+                meta_data=self.meta_data,
+            )
+
         # end the timer
         time_end = perf_counter()
         sim_time = time_end - time_start

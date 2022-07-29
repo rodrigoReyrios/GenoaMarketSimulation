@@ -4,3 +4,11 @@
 #cache and checkpoints
 .ipynb_checkpoints/
 GenoaMarket/__pycache__/
+#my personal login
+rod.json
+#changes file
+changes.txt
+#queries
+queries/DeleteTables.sql
+#experiments
+experiment*

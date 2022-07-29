@@ -1,0 +1,7 @@
+{
+    "dialect": "mariadb",
+    "driver": "mariadbconnector",
+    "pass": "",
+    "host": "",
+    "port": ""
+}

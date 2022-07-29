@@ -69,6 +69,23 @@ def make_demand_supply(buy_orders, sell_orders):
     return demand, supply
 
 
+def price_to_log_returns(prices):
+    """
+    function that takes in a list of prices, and returns a list of log price returns.
+    Note: the prices don't have to be in a numpy array, I wrap them in np.array jic.
+
+    Args:
+        prices :list - list of prices
+    Returns:
+        log_price_returns :numpy.array - numpy array of log price returns
+    Raises:
+        N/A
+    """
+    # return the log price returns array
+    prices = np.array(prices)
+    return np.log(prices[1:] / prices[:-1])
+
+
 class DType(Enum):
     """
     Simple child of Enum, meant to strong type which distribution to use when divvying up
